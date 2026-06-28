@@ -1,12 +1,12 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include "mpu9250.h"
+#include "mpu6500.h"
 
 // ESP32-C3 Default I2C Pins
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
 
-Mpu9250 imu(&Wire, Mpu9250::I2cAddr::I2C_ADDR_PRIM);
+Mpu6500 imu(&Wire, Mpu6500::I2cAddr::I2C_ADDR_PRIM);
 
 void setup() {
   // Start Serial communication
@@ -26,7 +26,7 @@ void setup() {
     }
   }
 
-  // Keep attempting to connect to MPU-9250, scanning the I2C bus on failure
+  // Keep attempting to connect to MPU-6500, scanning the I2C bus on failure
   bool initialized = false;
   while (!initialized) {
     // Scan I2C bus for troubleshooting
@@ -48,12 +48,12 @@ void setup() {
       Serial.printf(" -> Scan complete. Found %d device(s).\n", devicesFound);
     }
 
-    Serial.println("Connecting and configuring MPU-9250...");
+    Serial.println("Connecting and configuring MPU-6500...");
     if (imu.Begin()) {
       initialized = true;
-      Serial.println("MPU-9250 successfully initialized!");
+      Serial.println("MPU-6500 successfully initialized!");
     } else {
-      Serial.println("Error: Failed to communicate with MPU-9250 sensor.");
+      Serial.println("Error: Failed to communicate with MPU-6500 sensor.");
       Serial.println("Please check your wiring, sensor power, and I2C pins.");
       Serial.println("Retrying in 5 seconds...\n");
       delay(5000);
@@ -73,16 +73,9 @@ void loop() {
     Serial.print("Gyro [rad/s]: ");
     Serial.printf("X: %7.4f, Y: %7.4f, Z: %7.4f | ", gyro.x, gyro.y, gyro.z);
 
-    if (imu.new_mag_data()) {
-      Vector3f mag = imu.mag_ut();
-      Serial.printf("Mag [uT]: X: %7.2f, Y: %7.2f, Z: %7.2f | ", mag.x, mag.y, mag.z);
-    } else {
-      Serial.print("Mag [uT]: (No New Data) | ");
-    }
-    
     Serial.printf("Temp [C]: %5.1f\n", imu.die_temp_c());
   } else {
-    Serial.println("Failed to read MPU-9250 data.");
+    Serial.println("Failed to read MPU-6500 data.");
   }
 
   delay(200); // Read 5 times per second
