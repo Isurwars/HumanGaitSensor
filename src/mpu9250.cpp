@@ -84,13 +84,17 @@ bool Mpu9250::Begin() {
   }
 
   if (who_am_i_ == WHOAMI_MPU6500_) {
-    /* MPU-6500 is identical to MPU-9250 but ships without the AK8963. */
-    has_magnetometer_ = false;
-    Serial.println(" -> MPU-6500 detected (No internal magnetometer).");
+    /* WHO_AM_I = 0x70 matches the genuine MPU-6500, but many low-cost clones
+     * also report this value while still wiring an AK8963 on the auxiliary
+     * I2C bus. We always attempt to probe the AK8963; has_magnetometer_ will
+     * only be set to false if the probe finds nothing. */
+    Serial.println(" -> WHO_AM_I = 0x70 (MPU-6500 or clone). Probing for AK8963...");
   } else {
-    has_magnetometer_ = true;
     Serial.printf(" -> MPU-9250/9255 detected. WHOAMI: 0x%02X\n", who_am_i_);
   }
+  /* Optimistically enable the magnetometer path; the AK8963 probe below
+   * will set this to false if the sensor does not respond. */
+  has_magnetometer_ = true;
 
   /* ---- Pre-reset: power down AK8963 cleanly before resetting the MPU ---- */
   if (has_magnetometer_) {
@@ -123,64 +127,113 @@ bool Mpu9250::Begin() {
     if (!WriteRegister(USER_CTRL_, I2C_MST_EN_)) { return false; }
     if (!WriteRegister(I2C_MST_CTRL_, I2C_MST_CLK_)) { return false; }
 
-    /* Verify AK8963 identity. */
-    if (!ReadAk8963Registers(AK8963_WHOAMI_, sizeof(who_am_i_), &who_am_i_)) {
-      Serial.println(" -> Check AK8963 WHOAMI: Read failed!");
-      return false;
+    /* Probe the AK8963 via the MPU I2C master (slave 0 channel, address 0x0C).
+     * Many clones respond here with 0x00, either because:
+     *   a) No magnetometer is present, or
+     *   b) The on-board mag is a different IC at a different address (e.g.
+     *      QMC5883L at 0x0D), or
+     *   c) The clone's I2C master has a quirk that prevents the transaction.
+     * If the master probe fails we fall back to bypass mode — which bridges
+     * the host I2C bus directly to AUX_DA/CL — and scan the full 7-bit
+     * address space to see exactly what is physically present. */
+    if (!ReadAk8963Registers(AK8963_WHOAMI_, sizeof(who_am_i_), &who_am_i_) ||
+        (who_am_i_ != WHOAMI_AK8963_)) {
+      Serial.printf(" -> AK8963 not found via I2C master (raw read: 0x%02X).\n",
+                    who_am_i_);
+      has_magnetometer_ = false;
+
+      /* ---- Bypass-mode auxiliary bus scan (I2C interface only) ---- */
+      if (iface_ == Interface::I2C) {
+        Serial.println(" -> Scanning auxiliary bus via I2C bypass mode...");
+
+        /* Per MPU-9250 datasheet §7.3: I2C_MST_EN must be cleared BEFORE
+         * enabling bypass, otherwise the two masters may fight on the bus. */
+        WriteRegister(USER_CTRL_, 0x00);               /* Disable I2C master */
+        WriteRegister(INT_PIN_CFG_, I2C_BYPASS_EN_);   /* Bridge host ↔ aux bus */
+        delay(10);
+
+        int devs_found = 0;
+        for (uint8_t addr = 0x01; addr < 0x78; addr++) {
+          i2c_->beginTransmission(addr);
+          if (i2c_->endTransmission() == 0) {
+            Serial.printf(" -> Aux bus: device ACK'd at 0x%02X", addr);
+            /* Annotate well-known magnetometer addresses. */
+            if (addr == 0x0C) {
+              Serial.print("  (AK8963 / AK8975)");
+            } else if (addr == 0x0D) {
+              Serial.print("  (QMC5883L — common MPU-9250 clone mag)");
+            } else if (addr == 0x1E) {
+              Serial.print("  (HMC5883L)");
+            } else if (addr == static_cast<uint8_t>(dev_)) {
+              Serial.print("  (MPU itself — expected)");
+            }
+            Serial.println();
+            devs_found++;
+          }
+        }
+        if (devs_found == 0) {
+          Serial.println(" -> Aux bus: no devices found. "
+                         "No magnetometer physically present.");
+        }
+
+        /* Restore normal I2C master mode. */
+        WriteRegister(INT_PIN_CFG_, 0x00);     /* Clear bypass enable */
+        WriteRegister(USER_CTRL_, I2C_MST_EN_); /* Re-enable I2C master */
+        delay(10);
+      }
+    } else {
+      Serial.printf(" -> AK8963 detected. WHOAMI: 0x%02X\n", who_am_i_);
     }
-    if (who_am_i_ != WHOAMI_AK8963_) {
-      Serial.printf(" -> Check AK8963 WHOAMI: Invalid! "
-                    "Value: 0x%02X (Expected: 0x48)\n", who_am_i_);
-      return false;
-    }
-    Serial.printf(" -> AK8963 detected. WHOAMI: 0x%02X\n", who_am_i_);
 
-    /* ---- Read factory magnetometer sensitivity adjustment (ASA) values ---- */
-    /* AK8963 must be put into FUSE ROM mode to expose the ASA registers. */
-    if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_PWR_DOWN_)) { return false; }
-    delay(100);  /* AK8963 requires ≥ 100 ms between mode changes. */
+    /* ---- Full AK8963 calibration and mode setup (only if probe succeeded) ---- */
+    if (has_magnetometer_) {
+      /* ---- Read factory magnetometer sensitivity adjustment (ASA) values ---- */
+      /* AK8963 must be put into FUSE ROM mode to expose the ASA registers. */
+      if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_PWR_DOWN_)) { return false; }
+      delay(100);  /* AK8963 requires ≥ 100 ms between mode changes. */
 
-    if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_FUSE_ROM_)) { return false; }
-    delay(100);
+      if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_FUSE_ROM_)) { return false; }
+      delay(100);
 
-    if (!ReadAk8963Registers(AK8963_ASA_, sizeof(asa_buff_), asa_buff_)) {
-      return false;
-    }
+      if (!ReadAk8963Registers(AK8963_ASA_, sizeof(asa_buff_), asa_buff_)) {
+        return false;
+      }
 
-    /*
-     * Compute per-axis sensitivity adjustment scale factors.
-     *
-     * The AK8963 stores a factory-calibrated ASA byte for each axis.
-     * Per the AK8963 datasheet §8.3.11, the adjusted sensitivity is:
-     *
-     *   Hadj = H × ((ASA - 128) / 256 + 1)
-     *
-     * where H is the raw 16-bit measurement count.
-     *
-     * We fold the final unit conversion (counts → µT) into the same factor:
-     *   • Full-scale range of AK8963 in 16-bit mode: ±4912 µT
-     *   • Max 16-bit output value: 32760 counts
-     *   ⟹ 1 count = 4912 / 32760 µT ≈ 0.15 µT/count
-     *
-     * Combined factor stored in mag_scale_[i]:
-     *   mag_scale_[i] = ((ASA[i] - 128) / 256 + 1) × (4912 / 32760)
-     */
-    for (int i = 0; i < 3; i++) {
-      mag_scale_[i] = ((static_cast<float>(asa_buff_[i]) - 128.0f) / 256.0f + 1.0f)
-                      * 4912.0f / 32760.0f;
-    }
+      /*
+       * Compute per-axis sensitivity adjustment scale factors.
+       *
+       * The AK8963 stores a factory-calibrated ASA byte for each axis.
+       * Per the AK8963 datasheet §8.3.11, the adjusted sensitivity is:
+       *
+       *   Hadj = H × ((ASA - 128) / 256 + 1)
+       *
+       * where H is the raw 16-bit measurement count.
+       *
+       * We fold the final unit conversion (counts → µT) into the same factor:
+       *   • Full-scale range of AK8963 in 16-bit mode: ±4912 µT
+       *   • Max 16-bit output value: 32760 counts
+       *   ⟹ 1 count = 4912 / 32760 µT ≈ 0.15 µT/count
+       *
+       * Combined factor stored in mag_scale_[i]:
+       *   mag_scale_[i] = ((ASA[i] - 128) / 256 + 1) × (4912 / 32760)
+       */
+      for (int i = 0; i < 3; i++) {
+        mag_scale_[i] = ((static_cast<float>(asa_buff_[i]) - 128.0f) / 256.0f + 1.0f)
+                        * 4912.0f / 32760.0f;
+      }
 
-    /* Return AK8963 to power-down before setting measurement mode. */
-    if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_PWR_DOWN_)) { return false; }
+      /* Return AK8963 to power-down before setting measurement mode. */
+      if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_PWR_DOWN_)) { return false; }
 
-    /* Set AK8963 to 16-bit resolution, continuous measurement mode 2 (100 Hz).
-     * This is the default; ConfigSrd() may later switch to 8 Hz if needed. */
-    if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_CNT_MEAS2_)) { return false; }
-    delay(100);
+      /* Set AK8963 to 16-bit resolution, continuous measurement mode 2 (100 Hz).
+       * This is the default; ConfigSrd() may later switch to 8 Hz if needed. */
+      if (!WriteAk8963Register(AK8963_CNTL1_, AK8963_CNT_MEAS2_)) { return false; }
+      delay(100);
 
-    /* Restore PLL clock (AK8963 operations can disturb I2C master timing). */
-    if (!WriteRegister(PWR_MGMNT_1_, CLKSEL_PLL_)) { return false; }
-  }
+      /* Restore PLL clock (AK8963 operations can disturb I2C master timing). */
+      if (!WriteRegister(PWR_MGMNT_1_, CLKSEL_PLL_)) { return false; }
+    }  // if (has_magnetometer_) — AK8963 calibration
+  }  // if (has_magnetometer_) — outer AK8963 init block
 
   /* ---- Apply default IMU configuration ---- */
   if (!ConfigAccelRange(AccelRange::ACCEL_RANGE_16G))     { return false; }

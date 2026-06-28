@@ -514,6 +514,7 @@ class Mpu9250 {
 
   // --- Interrupt Control ---
   static constexpr uint8_t INT_PIN_CFG_    = 0x37;  ///< INT pin / bypass config
+  static constexpr uint8_t I2C_BYPASS_EN_ = 0x02;  ///< INT_PIN_CFG bit 1: connect host I2C bus directly to auxiliary bus (bypass I2C master)
   static constexpr uint8_t INT_ENABLE_     = 0x38;  ///< Interrupt enable
   static constexpr uint8_t INT_DISABLE_    = 0x00;  ///< Value to clear all interrupt enables
   static constexpr uint8_t INT_PULSE_50US_ = 0x00;  ///< INT pin: 50 µs pulse, active high
