@@ -1,12 +1,14 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include "mpu6500.h"
+#include "ble_manager.h"
 
 // ESP32-C3 Default I2C Pins
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9
 
 Mpu6500 imu(&Wire, Mpu6500::I2cAddr::I2C_ADDR_PRIM);
+BleManager ble;
 
 void setup() {
   // Start Serial communication
@@ -16,6 +18,10 @@ void setup() {
     delay(10); // Wait for serial port to connect
   }
   Serial.println("HumanGaitSensor (Sensor de Marcha) Starting...");
+
+  // Initialize BLE
+  Serial.println("Initializing BLE...");
+  ble.Begin("ESP32C3-Gait-Sensor");
 
   // Initialize I2C with default pins
   Serial.printf("Initializing I2C (SDA Pin: %d, SCL Pin: %d)...\n", I2C_SDA_PIN, I2C_SCL_PIN);
@@ -62,18 +68,28 @@ void setup() {
 }
 
 void loop() {
+  // Handle BLE connection/disconnection state changes
+  ble.HandleConnectionHousekeeping();
+
   // Read sensor data
   if (imu.Read()) {
     Vector3f accel = imu.accel_mps2();
     Vector3f gyro = imu.gyro_radps();
+    float temp = imu.die_temp_c();
     
+    // Print to Serial monitor
     Serial.print("IMU -> Accel [m/s^2]: ");
     Serial.printf("X: %7.3f, Y: %7.3f, Z: %7.3f | ", accel.x, accel.y, accel.z);
     
     Serial.print("Gyro [rad/s]: ");
     Serial.printf("X: %7.4f, Y: %7.4f, Z: %7.4f | ", gyro.x, gyro.y, gyro.z);
 
-    Serial.printf("Temp [C]: %5.1f\n", imu.die_temp_c());
+    Serial.printf("Temp [C]: %5.1f\n", temp);
+
+    // Stream sensor data to connected BLE clients
+    if (ble.IsConnected()) {
+      ble.UpdateSensorData(accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z, temp);
+    }
   } else {
     Serial.println("Failed to read MPU-6500 data.");
   }
